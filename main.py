@@ -357,7 +357,7 @@ async def main() -> None:
     async def cmd_start(message: types.Message):
         if message.chat.type != "private":
             return
-        await message.answer("Выберите язык / Тілді таңдаңыз:", reply_markup=lang_keyboard())
+        await message.answer("Тілді таңдаңыз / Выберите язык :", reply_markup=lang_keyboard())
 
     @dp.message(Command("help"))
     async def cmd_help(message: types.Message):
