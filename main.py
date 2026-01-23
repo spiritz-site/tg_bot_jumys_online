@@ -2,12 +2,15 @@ import os
 import asyncio
 import logging
 from dataclasses import dataclass
+from contextlib import asynccontextmanager
 
 import aiosqlite
 from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.exceptions import TelegramBadRequest
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -15,11 +18,15 @@ logging.basicConfig(level=logging.INFO)
 DB_PATH = "bot.db"
 
 
+# =========================
+# Texts / i18n
+# =========================
 @dataclass(frozen=True)
 class LangText:
     greeting: str
     help_text: str
     submitted: str
+    submitted_more: str
     vip_offer: str
     vip_details: str
     approved: str
@@ -127,29 +134,16 @@ VIP-объявление:
 Если нужна помощь, можете написать @spiritz777.
 """
 
-# ВАЖНО: заполни реквизиты ниже (я не могу придумать их за тебя)
-VIP_DETAILS_RU = (
-    "🔥 VIP-статус\n"
-    "• 7 дней — 2000 ₸\n"
-    "• 14 дней — 3000 ₸\n"
-    "• 30 дней — 5000 ₸\n\n"
-    "Оплата:\n"
-    "Kaspi: <+7 700 200 9510>\n"
-    "Карта: <4400 4303 4626 5066>\n"
-    "Получатель: <Жандос О.>\n\n"
-    "После оплаты отправьте чек/скрин — и мы подключим VIP."
+# Лучше держать реквизиты в .env (чтобы не светить в GitHub):
+# VIP_DETAILS_RU=...
+# VIP_DETAILS_KZ=...
+VIP_DETAILS_RU = os.getenv(
+    "VIP_DETAILS_RU",
+    "🔥 VIP-статус\n• 7 дней — 2000 ₸\n• 14 дней — 3000 ₸\n• 30 дней — 5000 ₸\n\nОплата: (заполни VIP_DETAILS_RU в .env)\n"
 )
-
-VIP_DETAILS_KZ = (
-    "🔥 VIP мәртебесі\n"
-    "• 7 күн — 2000 ₸\n"
-    "• 14 күн — 3000 ₸\n"
-    "• 30 күн — 5000 ₸\n\n"
-    "Төлем:\n"
-    "Kaspi: <+7 700 200 9510>\n"
-    "Карта: <4400 4303 4626 5066>\n"
-    "Алушы: <Жандос О.>\n\n"
-    "Төлемнен кейін чек/скрин жіберіңіз — VIP қосамыз."
+VIP_DETAILS_KZ = os.getenv(
+    "VIP_DETAILS_KZ",
+    "🔥 VIP мәртебесі\n• 7 күн — 2000 ₸\n• 14 күн — 3000 ₸\n• 30 күн — 5000 ₸\n\nТөлем: (.env ішіне VIP_DETAILS_KZ толтырыңыз)\n"
 )
 
 TEXTS = {
@@ -157,6 +151,7 @@ TEXTS = {
         greeting=RU_GREETING,
         help_text="Отправьте заявку сообщением (можно с фото/логотипом). Мы проверим и ответим.",
         submitted="Заявка отправлена. Ожидайте модерацию.",
+        submitted_more="Дополнение к заявке отправлено. Ожидайте модерацию.",
         vip_offer="Хотите добавить VIP-статус? (поднимем объявление вверх и отметим TOP)",
         vip_details=VIP_DETAILS_RU,
         approved="Заявка принята. Мы проверим данные и добавим на сайт. Если потребуется уточнение — напишем.",
@@ -167,6 +162,7 @@ TEXTS = {
         greeting=KZ_GREETING,
         help_text="Өтінімді хабарлама ретінде жіберіңіз (фото/логотип болса қосуға болады). Тексеріп, жауап береміз.",
         submitted="Өтінім жіберілді. Модерацияны күтіңіз.",
+        submitted_more="Өтінімге қосымша ақпарат жіберілді. Модерацияны күтіңіз.",
         vip_offer="VIP мәртебесін қосқыңыз келе ме? (хабарландыру жоғарыға шығып, TOP белгісі болады)",
         vip_details=VIP_DETAILS_KZ,
         approved="Өтінім қабылданды. Мәліметтерді тексеріп, сайтқа қосамыз. Қажет болса, нақтылау сұраймыз.",
@@ -176,6 +172,9 @@ TEXTS = {
 }
 
 
+# =========================
+# Keyboards
+# =========================
 def lang_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -203,15 +202,30 @@ def vip_offer_kb(ticket_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅", callback_data=f"vip:yes:{ticket_id}"),
-                InlineKeyboardButton(text="❌", callback_data=f"vip:no:{ticket_id}"),
+                InlineKeyboardButton(text="✅ Да", callback_data=f"vip:yes:{ticket_id}"),
+                InlineKeyboardButton(text="❌ Нет", callback_data=f"vip:no:{ticket_id}"),
             ]
         ]
     )
 
 
+# =========================
+# DB helpers
+# =========================
+@asynccontextmanager
+async def db_conn():
+    db = await aiosqlite.connect(DB_PATH)
+    try:
+        # Для устойчивости на телефоне
+        await db.execute("PRAGMA journal_mode=WAL;")
+        await db.execute("PRAGMA busy_timeout=5000;")
+        yield db
+    finally:
+        await db.close()
+
+
 async def init_db() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         await db.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -243,11 +257,45 @@ async def init_db() -> None:
             )
             """
         )
+        # Антидубликат (chat_id + message_id)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, message_id)
+            )
+            """
+        )
+
+        # Мягкая миграция: добавим колонки, если их ещё нет
+        for stmt in (
+            "ALTER TABLE tickets ADD COLUMN vip_offered INTEGER DEFAULT 0",
+            "ALTER TABLE tickets ADD COLUMN vip_choice TEXT DEFAULT NULL",   # yes/no
+        ):
+            try:
+                await db.execute(stmt)
+            except aiosqlite.OperationalError:
+                # колонка уже существует
+                pass
+
         await db.commit()
 
 
+async def mark_message_processed(chat_id: int, message_id: int) -> bool:
+    """True = обрабатываем впервые, False = уже было (защита от дублей)."""
+    async with db_conn() as db:
+        cur = await db.execute(
+            "INSERT OR IGNORE INTO processed_messages(chat_id, message_id) VALUES(?, ?)",
+            (chat_id, message_id),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+
+
 async def set_user_lang(user_id: int, lang: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         await db.execute(
             """
             INSERT INTO users(user_id, lang) VALUES(?, ?)
@@ -259,14 +307,14 @@ async def set_user_lang(user_id: int, lang: str) -> None:
 
 
 async def get_user_lang(user_id: int) -> str | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         cur = await db.execute("SELECT lang FROM users WHERE user_id=?", (user_id,))
         row = await cur.fetchone()
         return row[0] if row else None
 
 
 async def create_ticket(user_id: int, lang: str, admin_chat_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         cur = await db.execute(
             "INSERT INTO tickets(user_id, lang, status, admin_chat_id) VALUES(?, ?, ?, ?)",
             (user_id, lang, "new", admin_chat_id),
@@ -276,7 +324,7 @@ async def create_ticket(user_id: int, lang: str, admin_chat_id: int) -> int:
 
 
 async def set_ticket_header(ticket_id: int, header_msg_id: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         await db.execute(
             "UPDATE tickets SET admin_header_msg_id=? WHERE id=?",
             (header_msg_id, ticket_id),
@@ -285,23 +333,59 @@ async def set_ticket_header(ticket_id: int, header_msg_id: int) -> None:
 
 
 async def update_ticket_status(ticket_id: int, status: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         await db.execute("UPDATE tickets SET status=? WHERE id=?", (status, ticket_id))
         await db.commit()
 
 
-async def get_ticket(ticket_id: int) -> tuple[int, str, str, int, int | None] | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+async def set_ticket_vip_offered(ticket_id: int) -> None:
+    async with db_conn() as db:
+        await db.execute("UPDATE tickets SET vip_offered=1 WHERE id=?", (ticket_id,))
+        await db.commit()
+
+
+async def set_ticket_vip_choice(ticket_id: int, choice: str) -> None:
+    async with db_conn() as db:
+        await db.execute("UPDATE tickets SET vip_choice=? WHERE id=?", (choice, ticket_id))
+        await db.commit()
+
+
+async def get_ticket(ticket_id: int) -> tuple[int, str, str, int, int | None, int, str | None] | None:
+    # returns (user_id, lang, status, admin_chat_id, admin_header_msg_id, vip_offered, vip_choice)
+    async with db_conn() as db:
         cur = await db.execute(
-            "SELECT user_id, lang, status, admin_chat_id, admin_header_msg_id FROM tickets WHERE id=?",
+            """
+            SELECT user_id, lang, status, admin_chat_id, admin_header_msg_id,
+                   COALESCE(vip_offered, 0), vip_choice
+            FROM tickets WHERE id=?
+            """,
             (ticket_id,),
         )
         row = await cur.fetchone()
         return row if row else None
 
 
+async def get_open_ticket_for_user(user_id: int, admin_chat_id: int) -> tuple[int, int | None, str] | None:
+    """
+    Вернёт (ticket_id, header_msg_id, lang) если есть активный тикет (new / need_info / waiting_admin_text).
+    """
+    async with db_conn() as db:
+        cur = await db.execute(
+            """
+            SELECT id, admin_header_msg_id, lang
+            FROM tickets
+            WHERE user_id=? AND admin_chat_id=? AND status IN ('new', 'need_info', 'waiting_admin_text')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (user_id, admin_chat_id),
+        )
+        row = await cur.fetchone()
+        return row if row else None
+
+
 async def save_admin_prompt(prompt_msg_id: int, admin_chat_id: int, ticket_id: int, action: str) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         await db.execute(
             "INSERT OR REPLACE INTO admin_prompts(prompt_msg_id, admin_chat_id, ticket_id, action) VALUES(?, ?, ?, ?)",
             (prompt_msg_id, admin_chat_id, ticket_id, action),
@@ -310,7 +394,7 @@ async def save_admin_prompt(prompt_msg_id: int, admin_chat_id: int, ticket_id: i
 
 
 async def resolve_admin_prompt(prompt_msg_id: int, admin_chat_id: int) -> tuple[int, str] | None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         cur = await db.execute(
             "SELECT ticket_id, action FROM admin_prompts WHERE prompt_msg_id=? AND admin_chat_id=?",
             (prompt_msg_id, admin_chat_id),
@@ -320,23 +404,31 @@ async def resolve_admin_prompt(prompt_msg_id: int, admin_chat_id: int) -> tuple[
 
 
 async def delete_admin_prompt(prompt_msg_id: int) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with db_conn() as db:
         await db.execute("DELETE FROM admin_prompts WHERE prompt_msg_id=?", (prompt_msg_id,))
         await db.commit()
 
 
-def build_admin_header(user: types.User, lang: str, ticket_id: int) -> str:
+# =========================
+# Business helpers
+# =========================
+def build_admin_header(user: types.User, lang: str, ticket_id: int, vip_choice: str | None = None) -> str:
     username = f"@{user.username}" if user.username else "(no username)"
+    vip_line = f"\nVIP: {vip_choice}" if vip_choice else "\nVIP: —"
     return (
         f"🆕 Заявка #{ticket_id}\n"
         f"User: {user.full_name}\n"
         f"ID: {user.id}\n"
         f"Lang: {lang}\n"
-        f"Username: {username}\n\n"
+        f"Username: {username}"
+        f"{vip_line}\n\n"
         f"Действия ниже:"
     )
 
 
+# =========================
+# Main
+# =========================
 async def main() -> None:
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -357,7 +449,11 @@ async def main() -> None:
     async def cmd_start(message: types.Message):
         if message.chat.type != "private":
             return
-        await message.answer("Тілді таңдаңыз / Выберите язык :", reply_markup=lang_keyboard())
+        lang = await get_user_lang(message.from_user.id)
+        if lang in TEXTS:
+            await message.answer(TEXTS[lang].greeting)
+        else:
+            await message.answer("Тілді таңдаңыз / Выберите язык :", reply_markup=lang_keyboard())
 
     @dp.message(Command("help"))
     async def cmd_help(message: types.Message):
@@ -368,27 +464,34 @@ async def main() -> None:
 
     @dp.callback_query(F.data.startswith("lang:"))
     async def on_lang_choice(callback: types.CallbackQuery):
+        try:
+            await callback.answer()
+        except TelegramBadRequest:
+            pass
+
         lang = callback.data.split(":", 1)[1]
         if lang not in TEXTS:
-            await callback.answer("Unknown language", show_alert=True)
+            try:
+                await callback.answer("Unknown language", show_alert=True)
+            except TelegramBadRequest:
+                pass
             return
 
         await set_user_lang(callback.from_user.id, lang)
-        await callback.answer("OK")
 
         try:
             await callback.message.edit_reply_markup(reply_markup=None)
-        except Exception:
+        except TelegramBadRequest:
             pass
 
         await callback.message.answer(TEXTS[lang].greeting)
 
-    # Пользователь отправляет заявку в личке → создаём тикет и кидаем в админ-чат с кнопками
+    # Пользователь отправляет заявку в личке
     @dp.message(F.chat.type == "private")
     async def handle_user_message(message: types.Message):
         nonlocal admin_chat_id
 
-        # не пересылаем команды в поддержку
+        # команды не отправляем как заявки
         if message.text and message.text.startswith("/"):
             return
 
@@ -396,7 +499,37 @@ async def main() -> None:
             await message.answer("Поддержка ещё не настроена (ADMIN_CHAT_ID=0).")
             return
 
+        # Антидубликат: если Telegram отдал тот же апдейт повторно — игнорируем
+        first = await mark_message_processed(message.chat.id, message.message_id)
+        if not first:
+            return
+
         lang = await get_user_lang(message.from_user.id) or "ru"
+
+        # Если у пользователя уже есть активный тикет — не создаём новый, просто докидываем сообщение
+        open_ticket = await get_open_ticket_for_user(message.from_user.id, admin_chat_id)
+        if open_ticket:
+            ticket_id, header_msg_id, t_lang = open_ticket
+            # докидываем в админ-чат “в ответ” на шапку тикета (если она есть)
+            try:
+                await bot.copy_message(
+                    chat_id=admin_chat_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    reply_to_message_id=header_msg_id if header_msg_id else None,
+                )
+            except TelegramBadRequest:
+                # если reply_to_message_id не подходит, просто отправим без reply
+                await bot.copy_message(
+                    chat_id=admin_chat_id,
+                    from_chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
+
+            await message.answer(TEXTS[lang].submitted_more)
+            return
+
+        # Создаём новый тикет
         ticket_id = await create_ticket(message.from_user.id, lang, admin_chat_id)
 
         header_text = build_admin_header(message.from_user, lang, ticket_id)
@@ -414,64 +547,88 @@ async def main() -> None:
             reply_to_message_id=header_msg.message_id,
         )
 
-        # Ответ пользователю: локализовано + VIP оффер
+        # Пользователь: подтверждение + VIP оффер (один раз на тикет)
         await message.answer(TEXTS[lang].submitted)
+        await set_ticket_vip_offered(ticket_id)
         await message.answer(TEXTS[lang].vip_offer, reply_markup=vip_offer_kb(ticket_id))
 
     # VIP выбор пользователя
     @dp.callback_query(F.data.startswith("vip:"))
     async def on_vip_choice(callback: types.CallbackQuery):
+        try:
+            await callback.answer()
+        except TelegramBadRequest:
+            pass
+
         parts = callback.data.split(":")
         if len(parts) != 3:
-            await callback.answer("Bad callback", show_alert=True)
             return
 
         choice = parts[1]  # yes/no
         ticket_id = int(parts[2])
 
-        lang = await get_user_lang(callback.from_user.id) or "ru"
+        t = await get_ticket(ticket_id)
+        if not t:
+            return
+
+        user_id, lang, status, t_admin_chat_id, header_msg_id, vip_offered, vip_choice = t
+
+        # защита: кнопки может нажимать только тот пользователь, чей тикет
+        if callback.from_user.id != user_id:
+            try:
+                await callback.answer("Это не ваша заявка.", show_alert=True)
+            except TelegramBadRequest:
+                pass
+            return
+
+        user_lang = await get_user_lang(callback.from_user.id) or lang or "ru"
 
         if choice == "yes":
-            await callback.answer("OK")
-            await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.answer(TEXTS[lang].vip_details)
+            await set_ticket_vip_choice(ticket_id, "yes")
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
 
-            # уведомим админ-чат, что по тикету хотят VIP
-            if admin_chat_id != 0:
-                t = await get_ticket(ticket_id)
-                if t:
-                    _, _, _, _, header_msg_id = t
-                    note = f"🔥 Пользователь по заявке #{ticket_id} хочет VIP."
-                    if header_msg_id:
-                        await callback.bot.send_message(
-                            chat_id=admin_chat_id,
-                            text=note,
-                            reply_to_message_id=header_msg_id,
-                        )
-                    else:
-                        await callback.bot.send_message(chat_id=admin_chat_id, text=note)
+            await callback.message.answer(TEXTS[user_lang].vip_details)
+
+            # Уведомим админ-чат
+            if t_admin_chat_id != 0:
+                note = f"🔥 Пользователь по заявке #{ticket_id} хочет VIP."
+                try:
+                    await callback.bot.send_message(
+                        chat_id=t_admin_chat_id,
+                        text=note,
+                        reply_to_message_id=header_msg_id if header_msg_id else None,
+                    )
+                except TelegramBadRequest:
+                    await callback.bot.send_message(chat_id=t_admin_chat_id, text=note)
             return
 
         if choice == "no":
-            await callback.answer("OK")
-            await callback.message.edit_reply_markup(reply_markup=None)
+            await set_ticket_vip_choice(ticket_id, "no")
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
             return
-
-        await callback.answer("Неизвестный выбор", show_alert=True)
 
     # Нажатия админ-кнопок
     @dp.callback_query(F.data.startswith("a:"))
     async def on_admin_action(callback: types.CallbackQuery):
+        # Сразу подтверждаем нажатие (иначе будет "query is too old")
+        try:
+            await callback.answer()
+        except TelegramBadRequest:
+            pass
+
         if admin_chat_id == 0:
-            await callback.answer("ADMIN_CHAT_ID=0", show_alert=True)
             return
         if callback.message.chat.id != admin_chat_id:
-            await callback.answer("Не тот чат", show_alert=True)
             return
 
         parts = callback.data.split(":")
         if len(parts) != 3:
-            await callback.answer("Bad callback", show_alert=True)
             return
 
         action = parts[1]
@@ -479,23 +636,25 @@ async def main() -> None:
 
         t = await get_ticket(ticket_id)
         if not t:
-            await callback.answer("Тикет не найден", show_alert=True)
             return
 
-        user_id, lang, status, t_admin_chat_id, header_msg_id = t
+        user_id, lang, status, t_admin_chat_id, header_msg_id, vip_offered, vip_choice = t
         if t_admin_chat_id != admin_chat_id:
-            await callback.answer("Не тот админ-чат", show_alert=True)
             return
 
-        # Принять — без доп. вопросов
+        # Принять
         if action == "ok":
             await update_ticket_status(ticket_id, "approved")
-            await callback.message.edit_text(
-                callback.message.text + "\n\n✅ Статус: ПРИНЯТО",
-                reply_markup=None
-            )
+
+            try:
+                await callback.message.edit_text(
+                    callback.message.text + "\n\n✅ Статус: ПРИНЯТО",
+                    reply_markup=None
+                )
+            except TelegramBadRequest:
+                pass
+
             await bot.send_message(chat_id=user_id, text=TEXTS[lang].approved)
-            await callback.answer("Принято")
             return
 
         # Отклонить / Нужны данные — просим админа написать текст (reply)
@@ -514,14 +673,14 @@ async def main() -> None:
             )
             await save_admin_prompt(prompt_msg.message_id, admin_chat_id, ticket_id, action)
 
-            await callback.message.edit_text(
-                callback.message.text + "\n\n⏳ Статус: ОЖИДАЕТ ТЕКСТ ОТ АДМИНА",
-                reply_markup=None
-            )
-            await callback.answer("Ок, жду текст")
+            try:
+                await callback.message.edit_text(
+                    callback.message.text + "\n\n⏳ Статус: ОЖИДАЕТ ТЕКСТ ОТ АДМИНА",
+                    reply_markup=None
+                )
+            except TelegramBadRequest:
+                pass
             return
-
-        await callback.answer("Неизвестное действие", show_alert=True)
 
     # Админ пишет reply на prompt → бот отправляет юзеру
     @dp.message()
@@ -543,7 +702,7 @@ async def main() -> None:
             await delete_admin_prompt(message.reply_to_message.message_id)
             return
 
-        user_id, lang, status, _, _ = t
+        user_id, lang, status, _, _, _, _ = t
 
         admin_text = message.text or ""
         if not admin_text.strip():
