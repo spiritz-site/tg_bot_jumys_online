@@ -10,6 +10,7 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.client.default import DefaultBotProperties # <--- ВАЖНОЕ ИЗМЕНЕНИЕ
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -17,7 +18,6 @@ logging.basicConfig(level=logging.INFO)
 # --- КОНФИГУРАЦИЯ ---
 DB_PATH = "bot.db"
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-# Если 0, бот будет ждать настройки. Можно хардкодить, если лень менять .env
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
 if not BOT_TOKEN:
@@ -43,7 +43,6 @@ KZ_GREETING = """💸 <b>Тарифтер және қызметтер</b>
 • Сайтқа жариялау
 
 🗓 Жариялану мерзімі: 30 күн
-... (Ваш полный текст) ...
 """
 
 RU_GREETING = """💸 <b>Тарифы и услуги</b>
@@ -53,7 +52,6 @@ RU_GREETING = """💸 <b>Тарифы и услуги</b>
 • Публикация на сайте
 
 🗓 Срок размещения: 30 дней
-... (Ваш полный текст) ...
 """
 
 VIP_DETAILS_RU = "🔥 <b>VIP-статус</b>\nРеквизиты: ..."
@@ -92,7 +90,6 @@ def lang_keyboard() -> InlineKeyboardMarkup:
     ])
 
 def admin_actions_kb(ticket_id: int, user_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура управления тикетом + БАН"""
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Принять", callback_data=f"a:ok:{ticket_id}"),
@@ -127,7 +124,6 @@ async def db_fetch(sql: str, params: tuple = ()):
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # Таблица юзеров (добавил is_banned)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -135,7 +131,6 @@ async def init_db():
                 is_banned INTEGER DEFAULT 0
             )
         """)
-        # Таблица тикетов
         await db.execute("""
             CREATE TABLE IF NOT EXISTS tickets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,14 +142,12 @@ async def init_db():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Таблица для "Livegram" (связь ID сообщения админа -> ID юзера)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS message_map (
                 admin_msg_id INTEGER PRIMARY KEY,
                 user_id INTEGER NOT NULL
             )
         """)
-        # Таблица ожидания текста от админа (prompt)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS admin_prompts (
                 prompt_msg_id INTEGER PRIMARY KEY,
@@ -169,10 +162,12 @@ async def init_db():
 
 async def main():
     await init_db()
-    bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+    
+    # ВОТ ЗДЕСЬ БЫЛА ОШИБКА, ТЕПЕРЬ ИСПРАВЛЕНО:
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    
     dp = Dispatcher()
 
-    # 1. Приветствие
     @dp.message(Command("start"))
     async def cmd_start(message: types.Message):
         if message.chat.type == "private":
@@ -180,7 +175,6 @@ async def main():
         elif message.chat.id == ADMIN_CHAT_ID:
             await message.answer("🤖 Бот админ-панели активен.")
 
-    # 2. Выбор языка
     @dp.callback_query(F.data.startswith("lang:"))
     async def on_lang(cb: types.CallbackQuery):
         lang = cb.data.split(":")[1]
@@ -189,10 +183,9 @@ async def main():
         await cb.message.answer(TEXTS[lang].greeting)
         await cb.answer()
 
-    # 3. АДМИН: Ответ на сообщения (Livegram логика)
+    # АДМИН: Ответ на сообщения
     @dp.message(F.chat.id == ADMIN_CHAT_ID, F.reply_to_message)
     async def admin_reply_handler(message: types.Message):
-        # А. Проверка: Это ответ на "промпт" (ввод причины отклонения)?
         prompt_data = await db_fetch("SELECT ticket_id, action FROM admin_prompts WHERE prompt_msg_id=?", (message.reply_to_message.message_id,))
         
         if prompt_data:
@@ -211,42 +204,32 @@ async def main():
                 await message.react([types.ReactionTypeEmoji(emoji="👌")])
                 await message.reply(f"✅ Ответ отправлен пользователю (Тикет #{ticket_id})")
                 
-                # Обновляем статус
                 new_status = "rejected" if action == "rej" else "need_info"
                 await db_exec("UPDATE tickets SET status=? WHERE id=?", (new_status, ticket_id))
-                
-                # Удаляем промпт из базы
                 await db_exec("DELETE FROM admin_prompts WHERE prompt_msg_id=?", (message.reply_to_message.message_id,))
             except Exception as e:
-                await message.reply(f"❌ Не удалось отправить (пользователь заблокировал бота?):\n{e}")
+                await message.reply(f"❌ Не удалось отправить:\n{e}")
             return
 
-        # Б. Проверка: Это просто прямой ответ на пересланное сообщение?
         target_user_id = await db_fetch("SELECT user_id FROM message_map WHERE admin_msg_id=?", (message.reply_to_message.message_id,))
         
         if target_user_id:
             user_id = target_user_id[0]
             try:
-                # copy_to копирует любое содержимое (текст, фото, голос)
                 await message.copy_to(chat_id=user_id)
                 await message.react([types.ReactionTypeEmoji(emoji="👍")])
             except TelegramBadRequest:
-                await message.reply("❌ Пользователь заблокировал бота, сообщение не доставлено.")
+                await message.reply("❌ Пользователь заблокировал бота.")
             except Exception as e:
                 await message.reply(f"❌ Ошибка отправки: {e}")
-        else:
-            # Админ ответил сам себе или на системное сообщение без привязки
-            pass
 
-    # 4. ЮЗЕР: Отправка сообщения (создание тикета)
+    # ЮЗЕР: Отправка сообщения
     @dp.message(F.chat.type == "private")
     async def user_msg_handler(message: types.Message):
-        # Игнорируем команды
         if message.text and message.text.startswith("/"): return
 
         user_id = message.from_user.id
         
-        # Проверка на БАН
         user_row = await db_fetch("SELECT lang, is_banned FROM users WHERE user_id=?", (user_id,))
         lang = user_row[0] if user_row else "ru"
         is_banned = user_row[1] if user_row else 0
@@ -255,14 +238,12 @@ async def main():
             await message.answer(TEXTS[lang].banned_msg)
             return
 
-        # Создаем тикет в БД
         cur = await aiosqlite.connect(DB_PATH)
         async with cur as db:
             await db.execute("INSERT INTO tickets(user_id, lang, status, admin_chat_id) VALUES(?, ?, ?, ?)", (user_id, lang, "new", ADMIN_CHAT_ID))
             await db.commit()
-            ticket_id = cur.lastrowid # Получаем ID тикета
+            ticket_id = cur.lastrowid
 
-        # Формируем красивый хедер для админа
         safe_name = html.escape(message.from_user.full_name)
         username = message.from_user.username
         user_link = f"<a href='tg://user?id={user_id}'>{safe_name}</a>"
@@ -277,29 +258,17 @@ async def main():
         )
 
         try:
-            # 1. Отправляем хедер с кнопками
-            sent_header = await bot.send_message(
-                ADMIN_CHAT_ID, 
-                header_text, 
-                reply_markup=admin_actions_kb(ticket_id, user_id)
-            )
-            
-            # 2. Пересылаем сообщение юзера (Forward)
-            # Forward важен, чтобы админ видел автора в Telegram и мог нажать Reply
+            await bot.send_message(ADMIN_CHAT_ID, header_text, reply_markup=admin_actions_kb(ticket_id, user_id))
             forwarded_msg = await message.forward(chat_id=ADMIN_CHAT_ID)
-            
-            # 3. Сохраняем связь для Livegram-ответов
             await db_exec("INSERT INTO message_map (admin_msg_id, user_id) VALUES (?, ?)", (forwarded_msg.message_id, user_id))
             
-            # Ответ юзеру
             await message.answer(TEXTS[lang].submitted)
             await message.answer(TEXTS[lang].vip_offer, reply_markup=vip_offer_kb(ticket_id))
             
         except Exception as e:
             logging.error(f"Error in user_msg_handler: {e}")
-            await message.answer("Error processing request. Try again later.")
 
-    # 5. КНОПКИ АДМИНА
+    # КНОПКИ
     @dp.callback_query(F.data.startswith("a:"))
     async def admin_actions(cb: types.CallbackQuery):
         parts = cb.data.split(":")
@@ -308,62 +277,45 @@ async def main():
 
         t_data = await db_fetch("SELECT user_id, lang FROM tickets WHERE id=?", (ticket_id,))
         if not t_data:
-            await cb.answer("Тикет устарел или не найден", show_alert=True)
+            await cb.answer("Тикет устарел", show_alert=True)
             return
         
         user_id, lang = t_data
 
         if action == "ok":
-            # Принять
             await db_exec("UPDATE tickets SET status='approved' WHERE id=?", (ticket_id,))
             try:
                 await bot.send_message(user_id, TEXTS[lang].approved)
-                # Меняем текст сообщения админа
                 await cb.message.edit_text(cb.message.html_text + "\n\n✅ <b>СТАТУС: ПРИНЯТО</b>", reply_markup=None)
             except Exception:
-                await cb.answer("Юзер заблочил бота, но статус обновлен")
-        
+                pass
         elif action in ("rej", "need"):
-            # Отклонить или запросить инфо -> нужен текст
             action_text = "ОТКЛОНИТЬ" if action == "rej" else "ЗАПРОСИТЬ ИНФО"
-            prompt_msg = await cb.message.reply(
-                f"⌨️ <b>Введите текст для действия: {action_text}</b>\n"
-                f"Ответьте (Reply) на это сообщение.",
-            )
-            await db_exec("INSERT OR REPLACE INTO admin_prompts (prompt_msg_id, admin_chat_id, ticket_id, action) VALUES(?,?,?,?)", 
-                          (prompt_msg.message_id, ADMIN_CHAT_ID, ticket_id, action))
-            
+            prompt_msg = await cb.message.reply(f"⌨️ <b>Введите текст для действия: {action_text}</b>\nОтветьте (Reply) на это сообщение.")
+            await db_exec("INSERT OR REPLACE INTO admin_prompts (prompt_msg_id, admin_chat_id, ticket_id, action) VALUES(?,?,?,?)", (prompt_msg.message_id, ADMIN_CHAT_ID, ticket_id, action))
             await cb.message.edit_text(cb.message.html_text + f"\n\n⏳ <b>ОЖИДАНИЕ ТЕКСТА ({action_text})</b>", reply_markup=None)
             await cb.answer("Жду текст (Reply)")
 
-    # 6. КНОПКА БАНА
     @dp.callback_query(F.data.startswith("ban:"))
     async def admin_ban_user(cb: types.CallbackQuery):
         _, target_user_id, ticket_id = cb.data.split(":")
         target_user_id = int(target_user_id)
-
-        # Проверяем текущий статус
         row = await db_fetch("SELECT is_banned FROM users WHERE user_id=?", (target_user_id,))
         is_now_banned = row[0] if row else 0
 
         if is_now_banned:
-            # Разбанить
             await db_exec("UPDATE users SET is_banned=0 WHERE user_id=?", (target_user_id,))
             await cb.answer("Пользователь РАЗБАНЕН ✅")
             await cb.bot.send_message(ADMIN_CHAT_ID, f"User {target_user_id} разбанен.")
         else:
-            # Забанить
             await db_exec("UPDATE users SET is_banned=1 WHERE user_id=?", (target_user_id,))
             await cb.answer("Пользователь ЗАБАНЕН ⛔️")
-            await cb.bot.send_message(ADMIN_CHAT_ID, f"User {target_user_id} забанен! Больше сообщений от него не поступит.")
-            
-            # Удаляем клавиатуру у тикета, чтобы не путать
+            await cb.bot.send_message(ADMIN_CHAT_ID, f"User {target_user_id} забанен!")
             try:
                 await cb.message.edit_reply_markup(reply_markup=None)
             except:
                 pass
 
-    # 7. VIP КНОПКИ ЮЗЕРА
     @dp.callback_query(F.data.startswith("vip:"))
     async def vip_user_choice(cb: types.CallbackQuery):
         _, choice, t_id = cb.data.split(":")
@@ -372,13 +324,11 @@ async def main():
 
         if choice == "yes":
             await cb.message.edit_text(TEXTS[lang].vip_details, parse_mode="HTML")
-            # Уведомляем админа
-            await bot.send_message(ADMIN_CHAT_ID, f"🤑 <b>Юзер по тикету #{t_id} хочет VIP!</b>\nСвяжитесь с ним.", reply_to_message_id=None)
+            await bot.send_message(ADMIN_CHAT_ID, f"🤑 <b>Юзер по тикету #{t_id} хочет VIP!</b>", reply_to_message_id=None)
         else:
             await cb.message.delete()
         await cb.answer()
 
-    # Запуск
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
